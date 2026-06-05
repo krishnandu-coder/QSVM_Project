@@ -1,0 +1,222 @@
+# ==========================================================
+# Quantum Support Vector Machine (QSVM)
+# Space Debris Risk Classification
+# ==========================================================
+
+import numpy as np
+import pandas as pd
+
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import StandardScaler
+from sklearn.decomposition import PCA
+from sklearn.svm import SVC
+from sklearn.metrics import balanced_accuracy_score, f1_score
+
+import pennylane as qml
+
+# ==========================================================
+# LOAD DATA
+# ==========================================================
+
+train_df = pd.read_csv("train.csv")
+test_df = pd.read_csv("test.csv")
+
+# ==========================================================
+# PREPROCESSING
+# ==========================================================
+
+X = train_df.drop("risk_level", axis=1).ffill()
+y = train_df["risk_level"]
+
+test_df = test_df.ffill()
+
+# ==========================================================
+# FEATURE SCALING
+# ==========================================================
+
+scaler = StandardScaler()
+
+X_scaled = scaler.fit_transform(X)
+test_scaled = scaler.transform(test_df)
+
+# ==========================================================
+# PCA DIMENSION REDUCTION
+# ==========================================================
+
+pca = PCA(n_components=4)
+
+X_pca = pca.fit_transform(X_scaled)
+test_pca = pca.transform(test_scaled)
+
+# ==========================================================
+# TRAIN / VALIDATION SPLIT
+# ==========================================================
+
+X_train, X_val, y_train, y_val = train_test_split(
+    X_pca,
+    y,
+    test_size=0.20,
+    random_state=42,
+    stratify=y
+)
+
+# ==========================================================
+# SMALL SUBSET
+# (Required because quantum kernel computation is expensive)
+# ==========================================================
+
+X_train_small = X_train[:100]
+y_train_small = y_train.iloc[:100]
+
+X_val_small = X_val[:50]
+y_val_small = y_val.iloc[:50]
+
+# ==========================================================
+# QUANTUM DEVICE
+# ==========================================================
+
+n_qubits = 4
+
+dev = qml.device(
+    "lightning.qubit",
+    wires=n_qubits
+)
+
+# ==========================================================
+# QUANTUM FEATURE MAP
+# ==========================================================
+
+def feature_map(x):
+
+    for i in range(n_qubits):
+
+        qml.Hadamard(wires=i)
+        qml.RZ(x[i], wires=i)
+
+    for i in range(n_qubits - 1):
+
+        qml.CNOT(wires=[i, i + 1])
+        qml.RZ(x[i] * x[i + 1], wires=i + 1)
+
+# ==========================================================
+# QUANTUM KERNEL CIRCUIT
+# ==========================================================
+
+@qml.qnode(dev)
+def kernel_circuit(x1, x2):
+
+    feature_map(x1)
+    qml.adjoint(feature_map)(x2)
+
+    return qml.probs(
+        wires=range(n_qubits)
+    )
+
+# ==========================================================
+# KERNEL MATRIX
+# ==========================================================
+
+def quantum_kernel(X1, X2):
+
+    kernel = np.zeros(
+        (len(X1), len(X2))
+    )
+
+    for i in range(len(X1)):
+        for j in range(len(X2)):
+
+            kernel[i, j] = (
+                kernel_circuit(
+                    X1[i],
+                    X2[j]
+                )[0]
+            )
+
+    return kernel
+
+# ==========================================================
+# TRAIN QSVM
+# ==========================================================
+
+print("Computing training kernel...")
+
+K_train = quantum_kernel(
+    X_train_small,
+    X_train_small
+)
+
+print("Computing validation kernel...")
+
+K_val = quantum_kernel(
+    X_val_small,
+    X_train_small
+)
+
+qsvm = SVC(
+    kernel="precomputed"
+)
+
+qsvm.fit(
+    K_train,
+    y_train_small
+)
+
+# ==========================================================
+# VALIDATION RESULTS
+# ==========================================================
+
+y_pred = qsvm.predict(K_val)
+
+balanced_acc = balanced_accuracy_score(
+    y_val_small,
+    y_pred
+)
+
+macro_f1 = f1_score(
+    y_val_small,
+    y_pred,
+    average="macro"
+)
+
+print("\n===== QSVM RESULTS =====")
+print(
+    f"Balanced Accuracy: {balanced_acc:.4f}"
+)
+print(
+    f"Macro F1 Score: {macro_f1:.4f}"
+)
+
+# ==========================================================
+# TEST PREDICTIONS
+# ==========================================================
+
+print("\nComputing test kernel...")
+
+K_test = quantum_kernel(
+    test_pca,
+    X_train_small
+)
+
+y_test_quantum = qsvm.predict(
+    K_test
+)
+
+# ==========================================================
+# SAVE PREDICTIONS
+# ==========================================================
+
+predictions = pd.DataFrame({
+
+    "sample_id": np.arange(
+        len(test_df)
+    ),
+
+    "label_quantum": y_test_quantum
+})
+
+predictions.to_csv(
+    "predictions.csv",
+    index=False
+)
+
+print("\npredictions.csv saved successfully!")
